@@ -1,0 +1,22 @@
+[Unit]
+Description=Binance Spot RSI Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/binance-rsi-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/binance-rsi-bot/venv/bin/python /opt/binance-rsi-bot/bot.py
+Restart=always
+RestartSec=10
+# exit code 2 = salah konfigurasi: jangan restart terus-menerus
+RestartPreventExitStatus=2
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
