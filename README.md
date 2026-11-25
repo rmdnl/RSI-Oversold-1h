@@ -142,6 +142,8 @@ Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid 
 3. `./venv/bin/python bot.py --check`
 4. `sudo systemctl start binance-rsi-bot`
 
+**`--check`** aman dijalankan kapan saja, termasuk saat service berjalan (tidak trading dan tidak menulis state).
+
 **Mengubah `.env`**: restart service agar berlaku. Menghapus sebuah pair dari `SYMBOLS` tidak menghentikan pemantauan posisi terbuka pair itu.
 
 **Menutup posisi manual**: batalkan order OCO-nya di Binance (Open Orders), lalu jual koinnya manual bila perlu. Bot melihat OCO selesai tanpa order terisi, mengirim notifikasi, dan menghapus posisi itu dari pelacakan.

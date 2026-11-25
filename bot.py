@@ -290,6 +290,12 @@ def round_to_tick(value: Decimal, tick: Decimal, rounding) -> Decimal:
     return (value / tick).to_integral_value(rounding=rounding) * tick
 
 
+def redact(text: str) -> str:
+    """Sembunyikan signature request dan token bot Telegram dari pesan error sebelum masuk log."""
+    text = re.sub(r"signature=[0-9a-fA-F]+", "signature=***", text)
+    return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", text)
+
+
 def fmt(d: Decimal) -> str:
     s = format(d, "f")
     if "." in s:
@@ -446,7 +452,7 @@ class BinanceClient:
                 if is_read and attempt < max_attempts:
                     STOP.wait(2 ** attempt)
                     continue
-                raise err_cls(f"{method} {path}: {exc}") from exc
+                raise err_cls(f"{method} {path}: {redact(str(exc))}") from exc
 
             self._track(resp)
             if resp.status_code == 200:
@@ -566,7 +572,7 @@ class Notifier:
             requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
                           data={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
         except requests.RequestException as exc:
-            log.warning("Telegram gagal: %s", exc)
+            log.warning("Telegram gagal: %s", redact(str(exc)))
 
 
 def utc_now_str() -> str:
@@ -700,20 +706,26 @@ class Trader:
                  "n/a" if prev is None else f"{prev:.2f}", "n/a" if cur is None else f"{cur:.2f}",
                  f" -> SINYAL (RSI min episode {lowest:.2f})" if signal_ok else "")
 
-        self.state.last_candle[symbol] = open_ms
-        self.state.save()
+        def mark() -> None:
+            self.state.last_candle[symbol] = open_ms
+            self.state.save()
+
         if not signal_ok:
+            mark()
             return
 
         age_s = (now_ms - (open_ms + cfg.interval_ms)) / 1000
         if age_s > cfg.signal_max_age:
             log.warning("%s: sinyal sudah basi (%.0f dtk setelah close), dilewati", symbol, age_s)
+            mark()
             return
         if symbol in self.state.positions:
             log.info("%s: sudah ada posisi, sinyal dilewati", symbol)
+            mark()
             return
         if len(self.state.positions) >= cfg.max_open_positions:
             log.info("%s: batas MAX_OPEN_POSITIONS (%d) tercapai, sinyal dilewati", symbol, cfg.max_open_positions)
+            mark()
             return
         info = self.infos[symbol]
         if cfg.dry_run:
@@ -722,8 +734,13 @@ class Trader:
                    f"| TP {fmt(tp)} | SL stop {fmt(sl_stop)}")
             log.info(msg)
             self.notify.send(msg)
+            mark()
             return
+        # Bila melempar error SEBELUM order dikirim (mis. cek saldo gagal), candle tidak ditandai
+        # sehingga sinyal dicoba lagi di siklus berikut selama belum basi.
         self.open_position(symbol, info, cur)
+        mark()
+        self.advance_position(symbol)  # pasang OCO segera, tanpa menunggu siklus berikutnya
 
     # ---- entry ---------------------------------------------------------- #
     def open_position(self, symbol: str, info: SymbolInfo, rsi_now: float) -> None:
@@ -929,9 +946,11 @@ class Trader:
             return
         if status == "REJECT":
             log.error("%s: OCO berstatus REJECT, mencoba pasang ulang", symbol)
-            pos.update({"status": "UNPROTECTED", "oco_attempted": False})
+            pos.update({"status": "UNPROTECTED", "oco_attempted": False, "oco_failures": pos.get("oco_failures", 0) + 1})
             pos["oco_client_id"] = f"oco{int(time.time())}{uuid.uuid4().hex[:8]}"
             self.state.save()
+            if pos["oco_failures"] >= 2:
+                self._emergency_exit(symbol, pos, info)
             return
         if status != "ALL_DONE":
             log.warning("%s: status OCO tak dikenal: %s", symbol, status)
@@ -999,16 +1018,17 @@ class Trader:
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
-def setup_logging(data_dir: Path) -> None:
+def setup_logging(data_dir: Path, to_file: bool = True) -> None:
     fmt_ = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt_)
-    fh = RotatingFileHandler(data_dir / "bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt_)
     root.addHandler(sh)
-    root.addHandler(fh)
+    if to_file:
+        fh = RotatingFileHandler(data_dir / "bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+        fh.setFormatter(fmt_)
+        root.addHandler(fh)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
@@ -1036,9 +1056,10 @@ def main() -> int:
         print(f"[CONFIG ERROR] {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
-    setup_logging(cfg.data_dir)
-    lock = acquire_lock(cfg.data_dir)
-    if lock is None:
+    # --check hanya membaca (tidak trading, tidak menulis state), jadi aman dijalankan saat service berjalan
+    setup_logging(cfg.data_dir, to_file=not args.check)
+    lock = None if args.check else acquire_lock(cfg.data_dir)
+    if lock is None and not args.check:
         log.error("Instance lain sudah berjalan (bot.lock terkunci). Keluar.")
         return EXIT_LOCKED
 
