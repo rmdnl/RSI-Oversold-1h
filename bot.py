@@ -1066,6 +1066,12 @@ def main() -> int:
     except ConfigError as exc:
         log.error("[CONFIG ERROR] %s", exc)
         return EXIT_CONFIG_ERROR
+    except BinanceBanned as exc:
+        # Jangan langsung exit: systemd akan me-restart dan menembak API lagi selagi di-ban (memperpanjang ban).
+        log.error("Diblokir Binance saat startup: %s", exc)
+        if not args.check:
+            STOP.wait(min(exc.retry_after + 5, 3600))
+        return 1
     except BinanceError as exc:
         log.error("Gagal saat startup: %s", exc)
         return 1
