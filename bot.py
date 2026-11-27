@@ -419,6 +419,11 @@ class BinanceError(Exception):
     def not_found(self) -> bool:
         return self.code == -2013 or (self.status == 400 and "does not exist" in (self.msg or "").lower())
 
+    @property
+    def invalid_symbol(self) -> bool:
+        """Binance error -1121: Invalid symbol."""
+        return self.code == -1121
+
 
 class BinanceBanned(BinanceError):
     def __init__(self, status: int, msg: str, retry_after: float):
@@ -695,7 +700,12 @@ class Trader:
     def startup(self) -> None:
         cfg = self.cfg
         self.client.sync_time()
-        data = self.client.exchange_info(cfg.symbols)
+        try:
+            data = self.client.exchange_info(cfg.symbols)
+        except BinanceError as exc:
+            if exc.invalid_symbol:
+                raise ConfigError(f"Simbol tidak valid (Binance -1121): {', '.join(cfg.symbols)}. Periksa ejaan symbol di .env")
+            raise
         by_symbol = {s["symbol"]: s for s in data.get("symbols", [])}
         missing = [s for s in cfg.symbols if s not in by_symbol]
         if missing:
