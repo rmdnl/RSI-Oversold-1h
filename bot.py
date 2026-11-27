@@ -650,8 +650,13 @@ class Notifier:
         if not self.token:
             return
         try:
-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                          data={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
+            resp = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
+                                 data={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
+            if resp.status_code != 200:
+                # Log warning with status code and response body (redacted)
+                body = redact(resp.text[:200])
+                log.warning("Telegram HTTP %d: %s", resp.status_code, body)
+                # Could also send to a fallback chat or operator here
         except requests.RequestException as exc:
             log.warning("Telegram gagal: %s", redact(str(exc)))
 
@@ -1218,6 +1223,16 @@ def main() -> int:
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:
         print(f"[CONFIG ERROR] {exc}", file=sys.stderr)
+        # Send Telegram alert for load_config errors too (read token/chat from env)
+        from os import getenv
+        tg_token = getenv("TELEGRAM_BOT_TOKEN", "") or ""
+        tg_chat = getenv("TELEGRAM_CHAT_ID", "") or ""
+        if tg_token and tg_chat:
+            try:
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                              data={"chat_id": tg_chat, "text": f"🚫 [CONFIG ERROR] {exc}"[:4000]}, timeout=10)
+            except Exception:
+                pass
         return EXIT_CONFIG_ERROR
 
     # --check hanya membaca (tidak trading, tidak menulis state), jadi aman dijalankan saat service berjalan
@@ -1232,7 +1247,8 @@ def main() -> int:
 
     try:
         client = BinanceClient(cfg)
-        trader = Trader(cfg, client, State(cfg.state_path, cfg.venue), Notifier(cfg))
+        notifier = Notifier(cfg)
+        trader = Trader(cfg, client, State(cfg.state_path, cfg.venue), notifier)
         trader.startup()
         if args.check:
             now_ms = client.server_now_ms()
@@ -1245,23 +1261,32 @@ def main() -> int:
                 sig_ok, _ = detect_signal(rsi, cfg.rsi_oversold, cfg.rsi_trigger)
                 log.info("%s close=%s RSI=%.2f sinyal=%s", sym, close, rsi[-1], sig_ok)
             log.info("Cek selesai: konfigurasi & koneksi OK.")
+            notifier.send("✅ Bot check OK: konfigurasi & koneksi valid.")
             return 0
         trader.run()
         return 0
     except ConfigError as exc:
         log.error("[CONFIG ERROR] %s", exc)
+        notifier.send(f"🚫 [CONFIG ERROR] {exc}")
         return EXIT_CONFIG_ERROR
     except BinanceBanned as exc:
         # Jangan langsung exit: systemd akan me-restart dan menembak API lagi selagi di-ban (memperpanjang ban).
         log.error("Diblokir Binance saat startup: %s", exc)
+        notifier.send(f"🚫 Binance block saat startup: {exc.msg}. Retry after {exc.retry_after:.0f}s")
         if not args.check:
             STOP.wait(min(exc.retry_after + 5, 3600))
         return 1
     except BinanceError as exc:
         log.error("Gagal saat startup: %s", exc)
+        notifier.send(f"🚫 Startup Binance error: {exc}")
         return 1
     except NetworkError as exc:
         log.error("Gagal terhubung saat startup: %s", exc)
+        notifier.send(f"🚫 Startup network error: {exc}")
+        return 1
+    except Exception as exc:
+        log.exception("Error tak terduga saat startup")
+        notifier.send(f"🚫 Startup unexpected error: {exc}")
         return 1
 
 
