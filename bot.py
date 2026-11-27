@@ -1065,6 +1065,8 @@ class Trader:
         lst = self.client.get_order_list(pos["oco_client_id"])
         status = lst.get("listOrderStatus")
         if status == "EXECUTING":
+            # Check for stop-leg-triggered-but-limit-unfilled scenario
+            self._check_stop_triggered_unfilled(symbol, pos, lst)
             return
         if status == "REJECT":
             log.error("%s: OCO berstatus REJECT, mencoba pasang ulang", symbol)
@@ -1091,6 +1093,47 @@ class Trader:
             return
         reason = "TP" if filled.get("type") in ("LIMIT_MAKER", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT") else "SL"
         self._record_close(symbol, pos, reason, filled)
+
+    def _check_stop_triggered_unfilled(self, symbol: str, pos: dict, lst: dict) -> None:
+        """
+        Deteksi skenario: stop leg triggered (TP canceled) tapi limit order belum terisi.
+        Binance: saat satu leg kena, leg lain dibatalkan. Jika stop kena, TP dibatalkan,
+        stop-limit leg jadi order LIMIT biasa menunggu fill. listOrderStatus bisa masih EXECUTING.
+        """
+        orders = lst.get("orders", [])
+        if len(orders) != 2:
+            return
+        # Fetch detail both legs
+        leg_details = []
+        for leg in orders:
+            try:
+                o = self.client.get_order(symbol, order_id=leg["orderId"])
+                leg_details.append(o)
+            except BinanceError:
+                leg_details.append({"status": "UNKNOWN", "orderId": leg["orderId"]})
+        # Check if one leg CANCELED (TP) and other NEW/PARTIALLY_FILLED (stop-limit waiting)
+        statuses = [o.get("status") for o in leg_details]
+        types = [o.get("type") for o in leg_details]
+        # Pattern: LIMIT_MAKER (TP) CANCELED + STOP_LOSS_LIMIT (SL) NEW/PARTIALLY_FILLED
+        if "CANCELED" in statuses and any(s in ("NEW", "PARTIALLY_FILLED") for s in statuses):
+            tp_leg = None
+            sl_leg = None
+            for o in leg_details:
+                if o.get("type") == "LIMIT_MAKER" and o.get("status") == "CANCELED":
+                    tp_leg = o
+                elif o.get("type") == "STOP_LOSS_LIMIT" and o.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    sl_leg = o
+            if tp_leg and sl_leg:
+                msg = (f"⚠️ {symbol}: Stop leg TRIGGERED (TP canceled), tapi SL LIMIT belum terisi! "
+                       f"SL orderId={sl_leg.get('orderId')} status={sl_leg.get('status')} "
+                       f"limitPrice={sl_leg.get('price')} stopPrice={sl_leg.get('stopPrice')}. "
+                       f"Posisi unprotected. Operator: cek Binance Open Orders, putar manual atau tunggu fill.")
+                log.warning(msg)
+                self.notify.send(msg)
+                # Mark position for operator attention
+                pos["stop_triggered_unfilled"] = True
+                pos["sl_order_id"] = sl_leg.get("orderId")
+                self.state.save()
 
     def _record_close(self, symbol: str, pos: dict, reason: str, order: dict) -> None:
         exec_qty = Decimal(order.get("executedQty", "0"))
