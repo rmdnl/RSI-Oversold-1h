@@ -8,6 +8,8 @@ data/
 *.log
 *.lock
 state.json
+state*.json
+state*.json.*
 trades.csv
 
 # Python

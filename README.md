@@ -35,7 +35,7 @@ Bot trading spot Binance (Python) berbasis RSI, multi pair, semua parameter lewa
 | `.env.example` | Template konfigurasi (salin menjadi `.env`) |
 | `requirements.txt` | Dependensi (`requests`, `python-dotenv`) |
 | `binance-rsi-bot.service` | Unit systemd |
-| `.gitignore` | Mengecualikan `.env` dan `data/` dari git |
+| `.gitignore` | Mengecualikan `.env`, `data/`, `state*.json`, dan cache Python dari git |
 | `data/state.json` | Posisi terbuka dan candle terakhir yang diproses. **Jangan dihapus saat ada posisi terbuka** |
 | `data/trades.csv` | Riwayat trade tertutup (TP, SL, atau EMERGENCY_SELL) |
 | `data/bot.log` | Log (rotasi otomatis, 5 MB x 3 file) |
@@ -120,9 +120,10 @@ Jika folder atau user berbeda dari contoh di atas, sesuaikan `User`, `WorkingDir
 | `SIGNAL_MAX_AGE_SECONDS` | `600` | Sinyal yang lebih tua dari ini dilewati (minimal 60) |
 | `KLINE_LIMIT` | `500` | Jumlah candle untuk menghitung RSI (150-1000) |
 | `RECV_WINDOW_MS` | `5000` | Toleransi timestamp request (1000-60000) |
-| `EMERGENCY_SELL_ON_OCO_FAIL` | `true` | Jual market bila OCO gagal terpasang 2x |
-| `DATA_DIR` | `./data` | Lokasi state, log, dan riwayat trade |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | kosong | Isi keduanya atau kosongkan keduanya |
+|| `EMERGENCY_SELL_ON_OCO_FAIL` | `true` | Jual market bila OCO gagal terpasang 2x ||
+|| `DATA_DIR` | `./data` | Lokasi state, log, dan riwayat trade ||
+|| `STATE_FILE` | (otomatis) | Nama file state dalam `DATA_DIR`. Kosong = default per venue: `state.json` (mainnet) atau `state.testnet.json` (testnet). Jika diisi, harus path relatif (mis. `subdir/state.json`), tanpa `..` atau absolut. Memungkinkan menjalankan mainnet & testnet bersamaan dengan file state terpisah. ||
+|| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | kosong | Isi keduanya atau kosongkan keduanya ||
 
 Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid atau di luar rentang.
 
@@ -184,12 +185,20 @@ Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid 
 - Satu siklus beli dan jual berarti dua kali fee. Dengan TP 1%, keuntungan bersih bisa tinggal sekitar 0,8%; dengan SL 2%, kerugian bersih sekitar 2,2%. Pertimbangkan ini saat memilih `TP_PCT` dan `SL_PCT`.
 - Kolom `pnl_quote` dan `pnl_pct` di `data/trades.csv` dihitung **sebelum fee**.
 - Bila fee dipotong dari koin yang dibeli, bot mengurangkannya dari qty sebelum memasang OCO, jadi qty OCO sedikit lebih kecil dari qty beli.
-- Bot memvalidasi saat startup bahwa `QUOTE_PER_TRADE` cukup besar agar order TP/SL memenuhi `NOTIONAL` pair.
+- Bot memvalidasi saat startup bahwa `QUOTE_PER_TRADE` cukup besar agar **qty setelah pembulatan stepSize** × **harga entry** ≥ `minNotional` DAN qty × **harga SL limit** ≥ `minNotional`. Harga SL limit lebih rendah dari entry (kurang `SL_PCT`% + `SL_LIMIT_BUFFER_PCT`%), jadi notional di SL lebih kecil. Validasi pakai estimasi harga ticker saat startup; error menampilkan `qty_est`, `notional_entry`, `notional_SL`, `minNotional`.
+- Contoh minimum praktis (harga ticker saat tulis, bisa berubah):
+  - NEARUSDT (step 0.1, minNotional 5): butuh ~12 USDT (qty 6.2 @ 1.94 → notional SL ~5.9)
+  - SOLUSDT (step 0.01, minNotional 5): butuh ~6 USDT
+  - BTCUSDT (step 0.00001, minNotional 10): butuh ~11 USDT
+  - ETHUSDT (step 0.0001, minNotional 5): butuh ~6 USDT
+  - BNBUSDT (step 0.001, minNotional 10): butuh ~11 USDT
 
 ## Git
 
-- `.gitignore` sudah mengecualikan `.env`, `data/`, `venv/`, dan cache Python. `.env.example` tetap ikut di-commit.
+- `.gitignore` mengecualikan `.env`, `.env.*`, `data/`, `state*.json`, `venv/`, `.venv/`, log, dan cache Python. `.env.example` tetap ikut di-commit.
+- Nama file **wajib** diawali titik (`.gitignore`, `.env.example`). File `gitignore` atau `env.example` tidak pernah dibaca git dan tidak pernah ditemukan oleh perintah di README ini. Setelah mengubah nama file, buktikan dengan `git check-ignore -v .env` (harus mengembalikan satu baris aturan, bukan kosong).
 - Jangan pernah commit `.env`. Bila terlanjur ter-commit: `git rm --cached .env`, lalu **buat API key baru** di Binance karena key lama sudah tersimpan di riwayat git.
+- **State per environment**: Bot menulis venue (`mainnet`/`testnet`) ke `state.json`. Saat startup, bot memvalidasi kecocokan venue. Jika state file milik venue berbeda **dan memiliki posisi terbuka**, bot menolak start dengan `[CONFIG ERROR]`. Jika tidak ada posisi, bot adopsi venue saat ini. Gunakan `STATE_FILE` untuk nama file state kustom.
 
 ## Kepatuhan aturan API Binance
 

@@ -128,6 +128,13 @@ class Config:
     data_dir: Path
     tg_token: str
     tg_chat: str
+    state_file: str  # raw from env (may be empty)
+    state_path: Path  # resolved absolute path
+
+    @property
+    def venue(self) -> str:
+        """'mainnet' atau 'testnet'."""
+        return "testnet" if self.testnet else "mainnet"
 
     @property
     def interval_ms(self) -> int:
@@ -214,6 +221,19 @@ def load_config() -> Config:
 
     data_dir = Path(_get("DATA_DIR", str(BASE_DIR / "data")) or "").expanduser()
 
+    # STATE_FILE: explicit path (relative to DATA_DIR) or empty -> default per venue
+    raw_state_file = (_get("STATE_FILE", "") or "").strip()
+    if raw_state_file:
+        # validate no path traversal
+        if os.path.isabs(raw_state_file) or ".." in Path(raw_state_file).parts:
+            raise ConfigError("STATE_FILE tidak boleh path absolut atau mengandung '..'")
+        state_file = raw_state_file
+        state_path = (data_dir / raw_state_file).resolve()
+    else:
+        # default per venue
+        state_file = "state.testnet.json" if _get_bool("BINANCE_TESTNET", False) else "state.json"
+        state_path = (data_dir / state_file).resolve()
+
     return Config(
         api_key=api_key, api_secret=api_secret,
         testnet=_get_bool("BINANCE_TESTNET", False), dry_run=dry_run,
@@ -224,6 +244,7 @@ def load_config() -> Config:
         signal_max_age=max_age, kline_limit=klimit, recv_window=recv,
         emergency_sell=_get_bool("EMERGENCY_SELL_ON_OCO_FAIL", True),
         data_dir=data_dir, tg_token=tg_token, tg_chat=tg_chat,
+        state_file=state_file, state_path=state_path,
     )
 
 
@@ -340,6 +361,40 @@ def compute_levels(entry: Decimal, info: SymbolInfo, cfg: Config) -> tuple:
     return tp, sl_stop, sl_limit
 
 
+def compute_qty_and_notional(entry: Decimal, quote_per_trade: Decimal, info: SymbolInfo, cfg: Config) -> tuple:
+    """
+    Hitung qty entry (setelah pembulatan stepSize) dan notional di entry & SL limit.
+    Return: (qty_entry, notional_entry, notional_sl_limit)
+    """
+    # qty yang bisa dibeli dengan quote_per_trade (fee sudah dipotong di _place_buy)
+    # estimasi: quote_per_trade / entry_price, lalu floor ke stepSize
+    raw_qty = quote_per_trade / entry
+    qty = floor_to_step(raw_qty, info.step)
+    if qty < info.min_qty:
+        qty = Decimal(0)
+    notional_entry = qty * entry
+    # hitung sl_limit untuk notional di SL
+    tp, sl_stop, sl_limit = compute_levels(entry, info, cfg)
+    notional_sl = qty * sl_limit
+    return qty, notional_entry, notional_sl
+
+
+def check_notional_adequacy(quote_per_trade: Decimal, info: SymbolInfo, cfg: Config, entry: Decimal) -> tuple:
+    """
+    Validasi kelayakan notional dengan mempertimbangkan stepSize & sl_limit.
+    Return: (ok: bool, msg: str, qty: Decimal, notional_entry: Decimal, notional_sl: Decimal)
+    """
+    qty, notional_entry, notional_sl = compute_qty_and_notional(entry, quote_per_trade, info, cfg)
+    min_notional = info.min_notional
+    if qty == 0:
+        return False, f"qty {qty} < minQty {info.min_qty}", qty, notional_entry, notional_sl
+    if notional_entry < min_notional:
+        return False, f"notional entry {fmt(notional_entry)} < minNotional {fmt(min_notional)}", qty, notional_entry, notional_sl
+    if notional_sl < min_notional:
+        return False, f"notional SL limit {fmt(notional_sl)} < minNotional {fmt(min_notional)}", qty, notional_entry, notional_sl
+    return True, "", qty, notional_entry, notional_sl
+
+
 # --------------------------------------------------------------------------- #
 # Klien REST Binance (patuh rate limit, sinkronisasi waktu, penanganan error)
 # --------------------------------------------------------------------------- #
@@ -363,6 +418,11 @@ class BinanceError(Exception):
     @property
     def not_found(self) -> bool:
         return self.code == -2013 or (self.status == 400 and "does not exist" in (self.msg or "").lower())
+
+    @property
+    def invalid_symbol(self) -> bool:
+        """Binance error -1121: Invalid symbol."""
+        return self.code == -1121
 
 
 class BinanceBanned(BinanceError):
@@ -507,6 +567,10 @@ class BinanceClient:
     def klines(self, symbol: str, interval: str, limit: int) -> list:
         return self.request("GET", "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
+    def ticker_price(self, symbols: Optional[list] = None) -> list:
+        params = {"symbols": symbols} if symbols else {}
+        return self.request("GET", "/api/v3/ticker/price", params)
+
     # ---- endpoint signed ------------------------------------------------ #
     def account(self) -> dict:
         return self.request("GET", "/api/v3/account", {"omitZeroBalances": "true"}, signed=True)
@@ -532,17 +596,33 @@ class BinanceClient:
 # State (JSON atomik), notifikasi, trades.csv
 # --------------------------------------------------------------------------- #
 class State:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, venue: str):
         self.path = path
+        self.venue = venue  # "mainnet" or "testnet" (current bot venue)
         self.data = {"positions": {}, "last_candle": {}}
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 self.data["positions"] = dict(loaded.get("positions", {}))
                 self.data["last_candle"] = dict(loaded.get("last_candle", {}))
+                # venue tag in file (if missing, treat as legacy mainnet)
+                file_venue = loaded.get("venue", "mainnet")
+                if file_venue != venue:
+                    # if positions exist, this is a hard mismatch -> raise
+                    if self.data["positions"]:
+                        raise ConfigError(
+                            f"State file {path} belongs to venue '{file_venue}' but bot runs on '{venue}' "
+                            f"with open positions: {', '.join(self.data['positions'].keys())}. "
+                            f"Gunakan STATE_FILE yang benar atau kosongkan state dulu."
+                        )
+                    # no positions -> adopt current venue (will be saved on next save)
+                self.data["venue"] = venue  # always store current venue
             except (ValueError, OSError, AttributeError) as exc:
                 raise ConfigError(f"{path} rusak ({exc}). Periksa/rename file itu secara manual; "
                                   "jangan dihapus bila masih ada posisi terbuka.") from exc
+        else:
+            # new file - store current venue
+            self.data["venue"] = venue
 
     @property
     def positions(self) -> dict:
@@ -553,6 +633,7 @@ class State:
         return self.data["last_candle"]
 
     def save(self) -> None:
+        self.data["venue"] = self.venue
         tmp = self.path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, indent=2)
@@ -569,8 +650,13 @@ class Notifier:
         if not self.token:
             return
         try:
-            requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                          data={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
+            resp = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
+                                 data={"chat_id": self.chat, "text": text[:4000]}, timeout=10)
+            if resp.status_code != 200:
+                # Log warning with status code and response body (redacted)
+                body = redact(resp.text[:200])
+                log.warning("Telegram HTTP %d: %s", resp.status_code, body)
+                # Could also send to a fallback chat or operator here
         except requests.RequestException as exc:
             log.warning("Telegram gagal: %s", redact(str(exc)))
 
@@ -579,13 +665,22 @@ def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def append_trade(path: Path, row: list) -> None:
-    new = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        if new:
-            w.writerow(["waktu_utc", "symbol", "alasan", "qty", "harga_entry", "harga_exit", "pnl_quote", "pnl_pct"])
-        w.writerow(row)
+def append_trade(path: Path, row: list, notifier: Notifier | None = None, msg: str = "") -> None:
+    """Tulis baris ke trades.csv (non-raising). Kirim notifikasi SEBELUM menulis CSV."""
+    if notifier and msg:
+        try:
+            notifier.send(msg)
+        except Exception:
+            pass  # notifikasi best-effort
+    try:
+        new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["waktu_utc", "symbol", "alasan", "qty", "harga_entry", "harga_exit", "pnl_quote", "pnl_pct"])
+            w.writerow(row)
+    except Exception as exc:
+        log.warning("Gagal menulis trades.csv: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -610,7 +705,12 @@ class Trader:
     def startup(self) -> None:
         cfg = self.cfg
         self.client.sync_time()
-        data = self.client.exchange_info(cfg.symbols)
+        try:
+            data = self.client.exchange_info(cfg.symbols)
+        except BinanceError as exc:
+            if exc.invalid_symbol:
+                raise ConfigError(f"Simbol tidak valid (Binance -1121): {', '.join(cfg.symbols)}. Periksa ejaan symbol di .env")
+            raise
         by_symbol = {s["symbol"]: s for s in data.get("symbols", [])}
         missing = [s for s in cfg.symbols if s not in by_symbol]
         if missing:
@@ -630,10 +730,17 @@ class Trader:
             info = parse_symbol_info(s)
             if not info.oco_allowed:
                 raise ConfigError(f"{sym}: OCO tidak didukung untuk pair ini")
-            if cfg.quote_per_trade < info.min_notional * Decimal("1.1"):
+
+            # Notional check dengan stepSize & sl_limit: estimasi pakai ticker price
+            ticker = self.client.ticker_price([sym])
+            est_price = Decimal(ticker[0]["price"])
+            ok, msg, qty, notional_entry, notional_sl = check_notional_adequacy(
+                cfg.quote_per_trade, info, cfg, est_price)
+            if not ok:
                 raise ConfigError(f"{sym}: QUOTE_PER_TRADE={cfg.quote_per_trade} terlalu kecil; "
-                                  f"minimal ~{info.min_notional * Decimal('1.1')} {info.quote} "
-                                  "(agar order TP/SL tetap memenuhi min notional)")
+                                  f"qty_est={fmt(qty)} notional_entry={fmt(notional_entry)} "
+                                  f"notional_SL={fmt(notional_sl)} minNotional={fmt(info.min_notional)} ({msg})")
+
             self.infos[sym] = info
             quotes.add(info.quote)
         if len(quotes) > 1:
@@ -658,6 +765,26 @@ class Trader:
                  "DRY-RUN" if cfg.dry_run else "LIVE", " [TESTNET]" if cfg.testnet else "",
                  ",".join(cfg.symbols), cfg.interval, cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_trigger,
                  cfg.tp_pct, cfg.sl_pct, cfg.sl_type, cfg.quote_per_trade, cfg.max_open_positions)
+
+        # Check for legacy state file with positions (e.g., state.json when running testnet with state.testnet.json)
+        default_mainnet = cfg.data_dir / "state.json"
+        default_testnet = cfg.data_dir / "state.testnet.json"
+        legacy_path = default_testnet if cfg.venue == "mainnet" else default_mainnet
+        current_path = cfg.state_path
+        if legacy_path != current_path and legacy_path.exists():
+            try:
+                legacy_data = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_positions = legacy_data.get("positions", {})
+                if legacy_positions:
+                    msg = (f"State file lama {legacy_path.name} memiliki posisi terbuka: "
+                           f"{', '.join(legacy_positions.keys())}. "
+                           f"Bot memakai {current_path.name} ({cfg.venue}). "
+                           f"Jika posisi ini masih relevan, pindahkan ke {current_path.name} atau gunakan STATE_FILE yang benar.")
+                    log.warning(msg)
+                    self.notify.send(msg)
+            except Exception:
+                pass  # ignore legacy check failures
+
         if self.state.positions:
             log.info("Posisi dari state.json: %s", ", ".join(f"{k}:{v.get('status')}" for k, v in self.state.positions.items()))
 
@@ -943,6 +1070,8 @@ class Trader:
         lst = self.client.get_order_list(pos["oco_client_id"])
         status = lst.get("listOrderStatus")
         if status == "EXECUTING":
+            # Check for stop-leg-triggered-but-limit-unfilled scenario
+            self._check_stop_triggered_unfilled(symbol, pos, lst)
             return
         if status == "REJECT":
             log.error("%s: OCO berstatus REJECT, mencoba pasang ulang", symbol)
@@ -970,6 +1099,47 @@ class Trader:
         reason = "TP" if filled.get("type") in ("LIMIT_MAKER", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT") else "SL"
         self._record_close(symbol, pos, reason, filled)
 
+    def _check_stop_triggered_unfilled(self, symbol: str, pos: dict, lst: dict) -> None:
+        """
+        Deteksi skenario: stop leg triggered (TP canceled) tapi limit order belum terisi.
+        Binance: saat satu leg kena, leg lain dibatalkan. Jika stop kena, TP dibatalkan,
+        stop-limit leg jadi order LIMIT biasa menunggu fill. listOrderStatus bisa masih EXECUTING.
+        """
+        orders = lst.get("orders", [])
+        if len(orders) != 2:
+            return
+        # Fetch detail both legs
+        leg_details = []
+        for leg in orders:
+            try:
+                o = self.client.get_order(symbol, order_id=leg["orderId"])
+                leg_details.append(o)
+            except BinanceError:
+                leg_details.append({"status": "UNKNOWN", "orderId": leg["orderId"]})
+        # Check if one leg CANCELED (TP) and other NEW/PARTIALLY_FILLED (stop-limit waiting)
+        statuses = [o.get("status") for o in leg_details]
+        types = [o.get("type") for o in leg_details]
+        # Pattern: LIMIT_MAKER (TP) CANCELED + STOP_LOSS_LIMIT (SL) NEW/PARTIALLY_FILLED
+        if "CANCELED" in statuses and any(s in ("NEW", "PARTIALLY_FILLED") for s in statuses):
+            tp_leg = None
+            sl_leg = None
+            for o in leg_details:
+                if o.get("type") == "LIMIT_MAKER" and o.get("status") == "CANCELED":
+                    tp_leg = o
+                elif o.get("type") == "STOP_LOSS_LIMIT" and o.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                    sl_leg = o
+            if tp_leg and sl_leg:
+                msg = (f"⚠️ {symbol}: Stop leg TRIGGERED (TP canceled), tapi SL LIMIT belum terisi! "
+                       f"SL orderId={sl_leg.get('orderId')} status={sl_leg.get('status')} "
+                       f"limitPrice={sl_leg.get('price')} stopPrice={sl_leg.get('stopPrice')}. "
+                       f"Posisi unprotected. Operator: cek Binance Open Orders, putar manual atau tunggu fill.")
+                log.warning(msg)
+                self.notify.send(msg)
+                # Mark position for operator attention
+                pos["stop_triggered_unfilled"] = True
+                pos["sl_order_id"] = sl_leg.get("orderId")
+                self.state.save()
+
     def _record_close(self, symbol: str, pos: dict, reason: str, order: dict) -> None:
         exec_qty = Decimal(order.get("executedQty", "0"))
         proceeds = Decimal(order.get("cummulativeQuoteQty", "0"))
@@ -977,11 +1147,10 @@ class Trader:
         exit_price = proceeds / exec_qty if exec_qty > 0 else Decimal(0)
         pnl = proceeds - entry * exec_qty
         pnl_pct = (exit_price / entry - 1) * 100 if entry > 0 else Decimal(0)
-        append_trade(self.trades_csv, [utc_now_str(), symbol, reason, fmt(exec_qty), fmt(entry), fmt(exit_price),
-                                       f"{pnl:.4f}", f"{pnl_pct:.2f}"])
         msg = f"{reason} {symbol}: exit {fmt(exit_price)} (entry {fmt(entry)}) PnL ~{pnl:.4f} ({pnl_pct:.2f}%) sebelum fee"
+        append_trade(self.trades_csv, [utc_now_str(), symbol, reason, fmt(exec_qty), fmt(entry), fmt(exit_price),
+                                      f"{pnl:.4f}", f"{pnl_pct:.2f}"], self.notify, msg)
         log.info(msg)
-        self.notify.send(msg)
         self._drop_position(symbol)
 
     # ---- loop utama ----------------------------------------------------- #
@@ -1054,6 +1223,16 @@ def main() -> int:
         cfg.data_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:
         print(f"[CONFIG ERROR] {exc}", file=sys.stderr)
+        # Send Telegram alert for load_config errors too (read token/chat from env)
+        from os import getenv
+        tg_token = getenv("TELEGRAM_BOT_TOKEN", "") or ""
+        tg_chat = getenv("TELEGRAM_CHAT_ID", "") or ""
+        if tg_token and tg_chat:
+            try:
+                requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                              data={"chat_id": tg_chat, "text": f"🚫 [CONFIG ERROR] {exc}"[:4000]}, timeout=10)
+            except Exception:
+                pass
         return EXIT_CONFIG_ERROR
 
     # --check hanya membaca (tidak trading, tidak menulis state), jadi aman dijalankan saat service berjalan
@@ -1068,7 +1247,8 @@ def main() -> int:
 
     try:
         client = BinanceClient(cfg)
-        trader = Trader(cfg, client, State(cfg.data_dir / "state.json"), Notifier(cfg))
+        notifier = Notifier(cfg)
+        trader = Trader(cfg, client, State(cfg.state_path, cfg.venue), notifier)
         trader.startup()
         if args.check:
             now_ms = client.server_now_ms()
@@ -1081,23 +1261,32 @@ def main() -> int:
                 sig_ok, _ = detect_signal(rsi, cfg.rsi_oversold, cfg.rsi_trigger)
                 log.info("%s close=%s RSI=%.2f sinyal=%s", sym, close, rsi[-1], sig_ok)
             log.info("Cek selesai: konfigurasi & koneksi OK.")
+            notifier.send("✅ Bot check OK: konfigurasi & koneksi valid.")
             return 0
         trader.run()
         return 0
     except ConfigError as exc:
         log.error("[CONFIG ERROR] %s", exc)
+        notifier.send(f"🚫 [CONFIG ERROR] {exc}")
         return EXIT_CONFIG_ERROR
     except BinanceBanned as exc:
         # Jangan langsung exit: systemd akan me-restart dan menembak API lagi selagi di-ban (memperpanjang ban).
         log.error("Diblokir Binance saat startup: %s", exc)
+        notifier.send(f"🚫 Binance block saat startup: {exc.msg}. Retry after {exc.retry_after:.0f}s")
         if not args.check:
             STOP.wait(min(exc.retry_after + 5, 3600))
         return 1
     except BinanceError as exc:
         log.error("Gagal saat startup: %s", exc)
+        notifier.send(f"🚫 Startup Binance error: {exc}")
         return 1
     except NetworkError as exc:
         log.error("Gagal terhubung saat startup: %s", exc)
+        notifier.send(f"🚫 Startup network error: {exc}")
+        return 1
+    except Exception as exc:
+        log.exception("Error tak terduga saat startup")
+        notifier.send(f"🚫 Startup unexpected error: {exc}")
         return 1
 
 
