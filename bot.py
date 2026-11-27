@@ -617,13 +617,22 @@ def utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def append_trade(path: Path, row: list) -> None:
-    new = not path.exists()
-    with open(path, "a", newline="", encoding="utf-8") as fh:
-        w = csv.writer(fh)
-        if new:
-            w.writerow(["waktu_utc", "symbol", "alasan", "qty", "harga_entry", "harga_exit", "pnl_quote", "pnl_pct"])
-        w.writerow(row)
+def append_trade(path: Path, row: list, notifier: Notifier | None = None, msg: str = "") -> None:
+    """Tulis baris ke trades.csv (non-raising). Kirim notifikasi SEBELUM menulis CSV."""
+    if notifier and msg:
+        try:
+            notifier.send(msg)
+        except Exception:
+            pass  # notifikasi best-effort
+    try:
+        new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["waktu_utc", "symbol", "alasan", "qty", "harga_entry", "harga_exit", "pnl_quote", "pnl_pct"])
+            w.writerow(row)
+    except Exception as exc:
+        log.warning("Gagal menulis trades.csv: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,11 +1044,10 @@ class Trader:
         exit_price = proceeds / exec_qty if exec_qty > 0 else Decimal(0)
         pnl = proceeds - entry * exec_qty
         pnl_pct = (exit_price / entry - 1) * 100 if entry > 0 else Decimal(0)
-        append_trade(self.trades_csv, [utc_now_str(), symbol, reason, fmt(exec_qty), fmt(entry), fmt(exit_price),
-                                       f"{pnl:.4f}", f"{pnl_pct:.2f}"])
         msg = f"{reason} {symbol}: exit {fmt(exit_price)} (entry {fmt(entry)}) PnL ~{pnl:.4f} ({pnl_pct:.2f}%) sebelum fee"
+        append_trade(self.trades_csv, [utc_now_str(), symbol, reason, fmt(exec_qty), fmt(entry), fmt(exit_price),
+                                      f"{pnl:.4f}", f"{pnl_pct:.2f}"], self.notify, msg)
         log.info(msg)
-        self.notify.send(msg)
         self._drop_position(symbol)
 
     # ---- loop utama ----------------------------------------------------- #
