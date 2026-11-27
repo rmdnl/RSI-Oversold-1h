@@ -128,6 +128,13 @@ class Config:
     data_dir: Path
     tg_token: str
     tg_chat: str
+    state_file: str  # raw from env (may be empty)
+    state_path: Path  # resolved absolute path
+
+    @property
+    def venue(self) -> str:
+        """'mainnet' atau 'testnet'."""
+        return "testnet" if self.testnet else "mainnet"
 
     @property
     def interval_ms(self) -> int:
@@ -214,6 +221,19 @@ def load_config() -> Config:
 
     data_dir = Path(_get("DATA_DIR", str(BASE_DIR / "data")) or "").expanduser()
 
+    # STATE_FILE: explicit path (relative to DATA_DIR) or empty -> default per venue
+    raw_state_file = (_get("STATE_FILE", "") or "").strip()
+    if raw_state_file:
+        # validate no path traversal
+        if os.path.isabs(raw_state_file) or ".." in Path(raw_state_file).parts:
+            raise ConfigError("STATE_FILE tidak boleh path absolut atau mengandung '..'")
+        state_file = raw_state_file
+        state_path = (data_dir / raw_state_file).resolve()
+    else:
+        # default per venue
+        state_file = "state.testnet.json" if _get_bool("BINANCE_TESTNET", False) else "state.json"
+        state_path = (data_dir / state_file).resolve()
+
     return Config(
         api_key=api_key, api_secret=api_secret,
         testnet=_get_bool("BINANCE_TESTNET", False), dry_run=dry_run,
@@ -224,6 +244,7 @@ def load_config() -> Config:
         signal_max_age=max_age, kline_limit=klimit, recv_window=recv,
         emergency_sell=_get_bool("EMERGENCY_SELL_ON_OCO_FAIL", True),
         data_dir=data_dir, tg_token=tg_token, tg_chat=tg_chat,
+        state_file=state_file, state_path=state_path,
     )
 
 
@@ -532,17 +553,33 @@ class BinanceClient:
 # State (JSON atomik), notifikasi, trades.csv
 # --------------------------------------------------------------------------- #
 class State:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, venue: str):
         self.path = path
+        self.venue = venue  # "mainnet" or "testnet" (current bot venue)
         self.data = {"positions": {}, "last_candle": {}}
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 self.data["positions"] = dict(loaded.get("positions", {}))
                 self.data["last_candle"] = dict(loaded.get("last_candle", {}))
+                # venue tag in file (if missing, treat as legacy mainnet)
+                file_venue = loaded.get("venue", "mainnet")
+                if file_venue != venue:
+                    # if positions exist, this is a hard mismatch -> raise
+                    if self.data["positions"]:
+                        raise ConfigError(
+                            f"State file {path} belongs to venue '{file_venue}' but bot runs on '{venue}' "
+                            f"with open positions: {', '.join(self.data['positions'].keys())}. "
+                            f"Gunakan STATE_FILE yang benar atau kosongkan state dulu."
+                        )
+                    # no positions -> adopt current venue (will be saved on next save)
+                self.data["venue"] = venue  # always store current venue
             except (ValueError, OSError, AttributeError) as exc:
                 raise ConfigError(f"{path} rusak ({exc}). Periksa/rename file itu secara manual; "
                                   "jangan dihapus bila masih ada posisi terbuka.") from exc
+        else:
+            # new file - store current venue
+            self.data["venue"] = venue
 
     @property
     def positions(self) -> dict:
@@ -553,6 +590,7 @@ class State:
         return self.data["last_candle"]
 
     def save(self) -> None:
+        self.data["venue"] = self.venue
         tmp = self.path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, indent=2)
@@ -658,6 +696,26 @@ class Trader:
                  "DRY-RUN" if cfg.dry_run else "LIVE", " [TESTNET]" if cfg.testnet else "",
                  ",".join(cfg.symbols), cfg.interval, cfg.rsi_period, cfg.rsi_oversold, cfg.rsi_trigger,
                  cfg.tp_pct, cfg.sl_pct, cfg.sl_type, cfg.quote_per_trade, cfg.max_open_positions)
+
+        # Check for legacy state file with positions (e.g., state.json when running testnet with state.testnet.json)
+        default_mainnet = cfg.data_dir / "state.json"
+        default_testnet = cfg.data_dir / "state.testnet.json"
+        legacy_path = default_testnet if cfg.venue == "mainnet" else default_mainnet
+        current_path = cfg.state_path
+        if legacy_path != current_path and legacy_path.exists():
+            try:
+                legacy_data = json.loads(legacy_path.read_text(encoding="utf-8"))
+                legacy_positions = legacy_data.get("positions", {})
+                if legacy_positions:
+                    msg = (f"State file lama {legacy_path.name} memiliki posisi terbuka: "
+                           f"{', '.join(legacy_positions.keys())}. "
+                           f"Bot memakai {current_path.name} ({cfg.venue}). "
+                           f"Jika posisi ini masih relevan, pindahkan ke {current_path.name} atau gunakan STATE_FILE yang benar.")
+                    log.warning(msg)
+                    self.notify.send(msg)
+            except Exception:
+                pass  # ignore legacy check failures
+
         if self.state.positions:
             log.info("Posisi dari state.json: %s", ", ".join(f"{k}:{v.get('status')}" for k, v in self.state.positions.items()))
 
@@ -1068,7 +1126,7 @@ def main() -> int:
 
     try:
         client = BinanceClient(cfg)
-        trader = Trader(cfg, client, State(cfg.data_dir / "state.json"), Notifier(cfg))
+        trader = Trader(cfg, client, State(cfg.state_path, cfg.venue), Notifier(cfg))
         trader.startup()
         if args.check:
             now_ms = client.server_now_ms()
