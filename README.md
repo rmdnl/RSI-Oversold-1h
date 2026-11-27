@@ -35,7 +35,7 @@ Bot trading spot Binance (Python) berbasis RSI, multi pair, semua parameter lewa
 | `.env.example` | Template konfigurasi (salin menjadi `.env`) |
 | `requirements.txt` | Dependensi (`requests`, `python-dotenv`) |
 | `binance-rsi-bot.service` | Unit systemd |
-| `.gitignore` | Mengecualikan `.env` dan `data/` dari git |
+| `.gitignore` | Mengecualikan `.env`, `data/`, `state*.json`, dan cache Python dari git |
 | `data/state.json` | Posisi terbuka dan candle terakhir yang diproses. **Jangan dihapus saat ada posisi terbuka** |
 | `data/trades.csv` | Riwayat trade tertutup (TP, SL, atau EMERGENCY_SELL) |
 | `data/bot.log` | Log (rotasi otomatis, 5 MB x 3 file) |
@@ -188,7 +188,8 @@ Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid 
 
 ## Git
 
-- `.gitignore` sudah mengecualikan `.env`, `data/`, `venv/`, dan cache Python. `.env.example` tetap ikut di-commit.
+- `.gitignore` mengecualikan `.env`, `.env.*`, `data/`, `state*.json`, `venv/`, `.venv/`, log, dan cache Python. `.env.example` tetap ikut di-commit.
+- Nama file **wajib** diawali titik (`.gitignore`, `.env.example`). File `gitignore` atau `env.example` tidak pernah dibaca git dan tidak pernah ditemukan oleh perintah di README ini. Setelah mengubah nama file, buktikan dengan `git check-ignore -v .env` (harus mengembalikan satu baris aturan, bukan kosong).
 - Jangan pernah commit `.env`. Bila terlanjur ter-commit: `git rm --cached .env`, lalu **buat API key baru** di Binance karena key lama sudah tersimpan di riwayat git.
 
 ## Kepatuhan aturan API Binance
