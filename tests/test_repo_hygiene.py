@@ -13,6 +13,11 @@ def test_gitignore_is_named_with_leading_dot():
     assert not (ROOT / "gitignore").exists(), "file gitignore tanpa titik tidak pernah dibaca git"
 
 
+def test_env_example_is_named_with_leading_dot():
+    assert (ROOT / ".env.example").is_file(), ".env.example harus ada (di-rename dari env.example)"
+    assert not (ROOT / "env.example").exists(), "env.example tanpa titik tidak boleh ada"
+
+
 @pytest.mark.skipif(not shutil.which("git"), reason="git tidak tersedia")
 @pytest.mark.parametrize("path", [
     ".env",
