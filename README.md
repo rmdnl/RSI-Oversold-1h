@@ -185,7 +185,13 @@ Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid 
 - Satu siklus beli dan jual berarti dua kali fee. Dengan TP 1%, keuntungan bersih bisa tinggal sekitar 0,8%; dengan SL 2%, kerugian bersih sekitar 2,2%. Pertimbangkan ini saat memilih `TP_PCT` dan `SL_PCT`.
 - Kolom `pnl_quote` dan `pnl_pct` di `data/trades.csv` dihitung **sebelum fee**.
 - Bila fee dipotong dari koin yang dibeli, bot mengurangkannya dari qty sebelum memasang OCO, jadi qty OCO sedikit lebih kecil dari qty beli.
-- Bot memvalidasi saat startup bahwa `QUOTE_PER_TRADE` cukup besar agar order TP/SL memenuhi `NOTIONAL` pair.
+- Bot memvalidasi saat startup bahwa `QUOTE_PER_TRADE` cukup besar agar **qty setelah pembulatan stepSize** × **harga entry** ≥ `minNotional` DAN qty × **harga SL limit** ≥ `minNotional`. Harga SL limit lebih rendah dari entry (kurang `SL_PCT`% + `SL_LIMIT_BUFFER_PCT`%), jadi notional di SL lebih kecil. Validasi pakai estimasi harga ticker saat startup; error menampilkan `qty_est`, `notional_entry`, `notional_SL`, `minNotional`.
+- Contoh minimum praktis (harga ticker saat tulis, bisa berubah):
+  - NEARUSDT (step 0.1, minNotional 5): butuh ~12 USDT (qty 6.2 @ 1.94 → notional SL ~5.9)
+  - SOLUSDT (step 0.01, minNotional 5): butuh ~6 USDT
+  - BTCUSDT (step 0.00001, minNotional 10): butuh ~11 USDT
+  - ETHUSDT (step 0.0001, minNotional 5): butuh ~6 USDT
+  - BNBUSDT (step 0.001, minNotional 10): butuh ~11 USDT
 
 ## Git
 

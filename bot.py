@@ -361,6 +361,40 @@ def compute_levels(entry: Decimal, info: SymbolInfo, cfg: Config) -> tuple:
     return tp, sl_stop, sl_limit
 
 
+def compute_qty_and_notional(entry: Decimal, quote_per_trade: Decimal, info: SymbolInfo, cfg: Config) -> tuple:
+    """
+    Hitung qty entry (setelah pembulatan stepSize) dan notional di entry & SL limit.
+    Return: (qty_entry, notional_entry, notional_sl_limit)
+    """
+    # qty yang bisa dibeli dengan quote_per_trade (fee sudah dipotong di _place_buy)
+    # estimasi: quote_per_trade / entry_price, lalu floor ke stepSize
+    raw_qty = quote_per_trade / entry
+    qty = floor_to_step(raw_qty, info.step)
+    if qty < info.min_qty:
+        qty = Decimal(0)
+    notional_entry = qty * entry
+    # hitung sl_limit untuk notional di SL
+    tp, sl_stop, sl_limit = compute_levels(entry, info, cfg)
+    notional_sl = qty * sl_limit
+    return qty, notional_entry, notional_sl
+
+
+def check_notional_adequacy(quote_per_trade: Decimal, info: SymbolInfo, cfg: Config, entry: Decimal) -> tuple:
+    """
+    Validasi kelayakan notional dengan mempertimbangkan stepSize & sl_limit.
+    Return: (ok: bool, msg: str, qty: Decimal, notional_entry: Decimal, notional_sl: Decimal)
+    """
+    qty, notional_entry, notional_sl = compute_qty_and_notional(entry, quote_per_trade, info, cfg)
+    min_notional = info.min_notional
+    if qty == 0:
+        return False, f"qty {qty} < minQty {info.min_qty}", qty, notional_entry, notional_sl
+    if notional_entry < min_notional:
+        return False, f"notional entry {fmt(notional_entry)} < minNotional {fmt(min_notional)}", qty, notional_entry, notional_sl
+    if notional_sl < min_notional:
+        return False, f"notional SL limit {fmt(notional_sl)} < minNotional {fmt(min_notional)}", qty, notional_entry, notional_sl
+    return True, "", qty, notional_entry, notional_sl
+
+
 # --------------------------------------------------------------------------- #
 # Klien REST Binance (patuh rate limit, sinkronisasi waktu, penanganan error)
 # --------------------------------------------------------------------------- #
@@ -528,6 +562,10 @@ class BinanceClient:
     def klines(self, symbol: str, interval: str, limit: int) -> list:
         return self.request("GET", "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
 
+    def ticker_price(self, symbols: Optional[list] = None) -> list:
+        params = {"symbols": symbols} if symbols else {}
+        return self.request("GET", "/api/v3/ticker/price", params)
+
     # ---- endpoint signed ------------------------------------------------ #
     def account(self) -> dict:
         return self.request("GET", "/api/v3/account", {"omitZeroBalances": "true"}, signed=True)
@@ -677,10 +715,17 @@ class Trader:
             info = parse_symbol_info(s)
             if not info.oco_allowed:
                 raise ConfigError(f"{sym}: OCO tidak didukung untuk pair ini")
-            if cfg.quote_per_trade < info.min_notional * Decimal("1.1"):
+
+            # Notional check dengan stepSize & sl_limit: estimasi pakai ticker price
+            ticker = self.client.ticker_price([sym])
+            est_price = Decimal(ticker[0]["price"])
+            ok, msg, qty, notional_entry, notional_sl = check_notional_adequacy(
+                cfg.quote_per_trade, info, cfg, est_price)
+            if not ok:
                 raise ConfigError(f"{sym}: QUOTE_PER_TRADE={cfg.quote_per_trade} terlalu kecil; "
-                                  f"minimal ~{info.min_notional * Decimal('1.1')} {info.quote} "
-                                  "(agar order TP/SL tetap memenuhi min notional)")
+                                  f"qty_est={fmt(qty)} notional_entry={fmt(notional_entry)} "
+                                  f"notional_SL={fmt(notional_sl)} minNotional={fmt(info.min_notional)} ({msg})")
+
             self.infos[sym] = info
             quotes.add(info.quote)
         if len(quotes) > 1:
