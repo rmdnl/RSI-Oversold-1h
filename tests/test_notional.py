@@ -54,6 +54,7 @@ class TestNotionalAdequacy:
             candle_delay=3, signal_max_age=600, kline_limit=500, recv_window=5000,
             emergency_sell=True, data_dir=Path("/tmp"), tg_token="", tg_chat="",
             state_file="state.json", state_path=Path("/tmp/state.json"),
+            rsi_realtime=False, rsi_update_interval_ms=5000,
         )
         entry = Decimal("1.943")
         qty, notional_entry, notional_sl = bot.compute_qty_and_notional(entry, Decimal("20"), info, cfg)
@@ -81,6 +82,7 @@ class TestNotionalAdequacy:
             candle_delay=3, signal_max_age=600, kline_limit=500, recv_window=5000,
             emergency_sell=True, data_dir=Path("/tmp"), tg_token="", tg_chat="",
             state_file="state.json", state_path=Path("/tmp/state.json"),
+            rsi_realtime=False, rsi_update_interval_ms=5000,
         )
         ok, msg, qty, ne, ns = bot.check_notional_adequacy(Decimal("20"), info, cfg, Decimal("1.943"))
         assert ok
@@ -104,6 +106,7 @@ class TestNotionalAdequacy:
             candle_delay=3, signal_max_age=600, kline_limit=500, recv_window=5000,
             emergency_sell=True, data_dir=Path("/tmp"), tg_token="", tg_chat="",
             state_file="state.json", state_path=Path("/tmp/state.json"),
+            rsi_realtime=False, rsi_update_interval_ms=5000,
         )
         ok, msg, qty, ne, ns = bot.check_notional_adequacy(Decimal("0.1"), info, cfg, Decimal("1.943"))
         assert not ok
@@ -126,6 +129,7 @@ class TestNotionalAdequacy:
             candle_delay=3, signal_max_age=600, kline_limit=500, recv_window=5000,
             emergency_sell=True, data_dir=Path("/tmp"), tg_token="", tg_chat="",
             state_file="state.json", state_path=Path("/tmp/state.json"),
+            rsi_realtime=False, rsi_update_interval_ms=5000,
         )
         ok, msg, qty, ne, ns = bot.check_notional_adequacy(Decimal("50"), info, cfg, Decimal("1.0"))
         assert not ok
@@ -148,6 +152,7 @@ class TestNotionalAdequacy:
             candle_delay=3, signal_max_age=600, kline_limit=500, recv_window=5000,
             emergency_sell=True, data_dir=Path("/tmp"), tg_token="", tg_chat="",
             state_file="state.json", state_path=Path("/tmp/state.json"),
+            rsi_realtime=False, rsi_update_interval_ms=5000,
         )
         ok, msg, qty, ne, ns = bot.check_notional_adequacy(Decimal("25"), info, cfg, Decimal("1.0"))
         assert not ok

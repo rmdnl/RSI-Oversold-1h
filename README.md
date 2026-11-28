@@ -123,6 +123,8 @@ Jika folder atau user berbeda dari contoh di atas, sesuaikan `User`, `WorkingDir
 || `EMERGENCY_SELL_ON_OCO_FAIL` | `true` | Jual market bila OCO gagal terpasang 2x ||
 || `DATA_DIR` | `./data` | Lokasi state, log, dan riwayat trade ||
 || `STATE_FILE` | (otomatis) | Nama file state dalam `DATA_DIR`. Kosong = default per venue: `state.json` (mainnet) atau `state.testnet.json` (testnet). Jika diisi, harus path relatif (mis. `subdir/state.json`), tanpa `..` atau absolut. Memungkinkan menjalankan mainnet & testnet bersamaan dengan file state terpisah. ||
+|| `RSI_REALTIME` | `false` | `true` = gunakan forming candle (realtime), evaluasi RSI tiap `RSI_UPDATE_SECONDS` detik. Entry immediate saat sinyal trigger. `false` = hanya closed candle (default). ||
+|| `RSI_UPDATE_SECONDS` | `5` | Interval update RSI saat `RSI_REALTIME=true` (1-60 detik). Default 5 detik. ||
 || `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | kosong | Isi keduanya atau kosongkan keduanya ||
 
 Bot menolak start dengan pesan `[CONFIG ERROR]` bila ada nilai yang tidak valid atau di luar rentang.

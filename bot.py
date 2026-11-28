@@ -130,6 +130,8 @@ class Config:
     tg_chat: str
     state_file: str  # raw from env (may be empty)
     state_path: Path  # resolved absolute path
+    rsi_realtime: bool
+    rsi_update_interval_ms: int
 
     @property
     def venue(self) -> str:
@@ -234,6 +236,13 @@ def load_config() -> Config:
         state_file = "state.testnet.json" if _get_bool("BINANCE_TESTNET", False) else "state.json"
         state_path = (data_dir / state_file).resolve()
 
+    # Realtime RSI config
+    rsi_realtime = _get_bool("RSI_REALTIME", False)
+    rsi_update_interval = _get_int("RSI_UPDATE_SECONDS", 5)
+    if not (1 <= rsi_update_interval <= 60):
+        raise ConfigError("RSI_UPDATE_SECONDS harus 1 - 60")
+    rsi_update_interval_ms = rsi_update_interval * 1000
+
     return Config(
         api_key=api_key, api_secret=api_secret,
         testnet=_get_bool("BINANCE_TESTNET", False), dry_run=dry_run,
@@ -245,6 +254,7 @@ def load_config() -> Config:
         emergency_sell=_get_bool("EMERGENCY_SELL_ON_OCO_FAIL", True),
         data_dir=data_dir, tg_token=tg_token, tg_chat=tg_chat,
         state_file=state_file, state_path=state_path,
+        rsi_realtime=rsi_realtime, rsi_update_interval_ms=rsi_update_interval_ms,
     )
 
 
@@ -599,12 +609,14 @@ class State:
     def __init__(self, path: Path, venue: str):
         self.path = path
         self.venue = venue  # "mainnet" or "testnet" (current bot venue)
-        self.data = {"positions": {}, "last_candle": {}}
+        self.data = {"positions": {}, "last_candle": {}, "last_realtime_check": {}, "last_realtime_entry": {}}
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
                 self.data["positions"] = dict(loaded.get("positions", {}))
                 self.data["last_candle"] = dict(loaded.get("last_candle", {}))
+                self.data["last_realtime_check"] = dict(loaded.get("last_realtime_check", {}))
+                self.data["last_realtime_entry"] = dict(loaded.get("last_realtime_entry", {}))
                 # venue tag in file (if missing, treat as legacy mainnet)
                 file_venue = loaded.get("venue", "mainnet")
                 if file_venue != venue:
@@ -631,6 +643,14 @@ class State:
     @property
     def last_candle(self) -> dict:
         return self.data["last_candle"]
+
+    @property
+    def last_realtime_check(self) -> dict:
+        return self.data["last_realtime_check"]
+
+    @property
+    def last_realtime_entry(self) -> dict:
+        return self.data["last_realtime_entry"]
 
     def save(self) -> None:
         self.data["venue"] = self.venue
@@ -800,56 +820,122 @@ class Trader:
         return self._balance_from(self.client.account(), asset)
 
     # ---- sinyal --------------------------------------------------------- #
-    def latest_closed_open_ms(self, now_ms: int) -> int:
-        ivl = self.cfg.interval_ms
-        return ((now_ms - self.cfg.candle_delay * 1000) // ivl) * ivl - ivl
+        def latest_closed_open_ms(self, now_ms: int) -> int:
+            ivl = self.cfg.interval_ms
+            return ((now_ms - self.cfg.candle_delay * 1000) // ivl) * ivl - ivl
 
-    def analyze(self, symbol: str, now_ms: Optional[int] = None):
-        """Ambil kline, kembalikan (open_ms_candle_terakhir, close, rsi_list) atau None bila belum siap."""
-        now_ms = now_ms or self.client.server_now_ms()
-        expected = self.latest_closed_open_ms(now_ms)
-        klines = self.client.klines(symbol, self.cfg.interval, self.cfg.kline_limit)
-        closed = [k for k in klines if int(k[6]) < now_ms]
-        if not closed or int(closed[-1][0]) != expected:
-            return None
-        closes = [float(k[4]) for k in closed]
-        return int(closed[-1][0]), closes[-1], rsi_wilder(closes, self.cfg.rsi_period)
+        def latest_forming_open_ms(self, now_ms: int) -> int:
+            """Open time of the currently forming (not yet closed) candle."""
+            ivl = self.cfg.interval_ms
+            return ((now_ms - self.cfg.candle_delay * 1000) // ivl) * ivl
 
-    def process_symbol(self, symbol: str) -> None:
-        cfg = self.cfg
-        now_ms = self.client.server_now_ms()
-        expected = self.latest_closed_open_ms(now_ms)
-        if self.state.last_candle.get(symbol, 0) >= expected:
-            return
-        result = self.analyze(symbol, now_ms)
-        if result is None:
-            log.debug("%s: candle close terbaru belum tersedia, coba lagi", symbol)
-            return
-        open_ms, close, rsi = result
-        cur, prev = rsi[-1], rsi[-2]
-        signal_ok, lowest = detect_signal(rsi, cfg.rsi_oversold, cfg.rsi_trigger)
-        close_ts = datetime.fromtimestamp(open_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
-        log.info("%s candle %s UTC close=%s RSI prev=%s cur=%s%s", symbol, close_ts, close,
-                 "n/a" if prev is None else f"{prev:.2f}", "n/a" if cur is None else f"{cur:.2f}",
-                 f" -> SINYAL (RSI min episode {lowest:.2f})" if signal_ok else "")
+        def analyze(self, symbol: str, now_ms: Optional[int] = None, use_forming: bool = False):
+            """Ambil kline, kembalikan (open_ms, close, rsi_list).
+            use_forming=True: gunakan candle forming (realtime), False: hanya closed candle.
+            """
+            now_ms = now_ms or self.client.server_now_ms()
+            if use_forming:
+                expected = self.latest_forming_open_ms(now_ms)
+            else:
+                expected = self.latest_closed_open_ms(now_ms)
+            klines = self.client.klines(symbol, self.cfg.interval, self.cfg.kline_limit)
+            if use_forming:
+                # Gunakan semua candle termasuk yang masih forming (close_time >= now_ms)
+                # Ambil KLINE_LIMIT candle terakhir
+                candles = klines[-self.cfg.kline_limit:] if len(klines) >= self.cfg.kline_limit else klines
+            else:
+                closed = [k for k in klines if int(k[6]) < now_ms]
+                if not closed or int(closed[-1][0]) != expected:
+                    return None
+                candles = closed
+            closes = [float(k[4]) for k in candles]
+            open_ms = int(candles[-1][0])
+            close = closes[-1]
+            return open_ms, close, rsi_wilder(closes, self.cfg.rsi_period)
 
-        def mark() -> None:
-            self.state.last_candle[symbol] = open_ms
-            self.state.save()
+        def process_symbol(self, symbol: str) -> None:
+            cfg = self.cfg
+            now_ms = self.client.server_now_ms()
 
-        if not signal_ok:
-            mark()
-            return
+            # Realtime mode: check forming candle every RSI_UPDATE_SECONDS
+            if cfg.rsi_realtime:
+                # Check if enough time passed since last check for this symbol
+                last_check = self.state.last_realtime_check.get(symbol, 0)
+                if now_ms - last_check < cfg.rsi_update_interval_ms:
+                    return
+                self.state.last_realtime_check[symbol] = now_ms
+                self.state.save()
 
-        age_s = (now_ms - (open_ms + cfg.interval_ms)) / 1000
-        if age_s > cfg.signal_max_age:
-            log.warning("%s: sinyal sudah basi (%.0f dtk setelah close), dilewati", symbol, age_s)
-            mark()
-            return
-        if symbol in self.state.positions:
-            log.info("%s: sudah ada posisi, sinyal dilewati", symbol)
-            mark()
-            return
+                # Analyze with forming candle
+                result = self.analyze(symbol, now_ms, use_forming=True)
+                if result is None:
+                    return
+                open_ms, close, rsi = result
+                cur, prev = rsi[-1], rsi[-2]
+                signal_ok, lowest = detect_signal(rsi, cfg.rsi_oversold, cfg.rsi_trigger)
+
+                close_ts = datetime.fromtimestamp(open_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+                # Need to re-fetch klines to get close_time for forming status
+                klines = self.client.klines(symbol, self.cfg.interval, self.cfg.kline_limit)
+                candles = klines[-self.cfg.kline_limit:] if len(klines) >= self.cfg.kline_limit else klines
+                forming_status = "FORMING" if int(candles[-1][6]) >= now_ms else "CLOSED"
+                log.info("%s [%s] %s UTC close=%s RSI prev=%s cur=%s%s", symbol, forming_status, close_ts, close,
+                         "n/a" if prev is None else f"{prev:.2f}", "n/a" if cur is None else f"{cur:.2f}",
+                         f" -> SINYAL (RSI min episode {lowest:.2f})" if signal_ok else "")
+
+                if not signal_ok:
+                    return
+
+                # Signal triggered on forming candle - enter immediately
+                if symbol in self.state.positions:
+                    log.info("%s: sudah ada posisi, sinyal dilewati", symbol)
+                    return
+
+                # Check if we already entered on this forming candle
+                last_entry = self.state.last_realtime_entry.get(symbol, 0)
+                if last_entry == open_ms:
+                    log.info("%s: sudah entry pada forming candle ini, menunggu close", symbol)
+                    return
+
+                # Execute entry
+                self._place_buy(symbol, close)
+                self.state.last_realtime_entry[symbol] = open_ms
+                self.state.save()
+                return
+
+            # Original closed-candle mode
+            expected = self.latest_closed_open_ms(now_ms)
+            if self.state.last_candle.get(symbol, 0) >= expected:
+                return
+            result = self.analyze(symbol, now_ms, use_forming=False)
+            if result is None:
+                log.debug("%s: candle close terbaru belum tersedia, coba lagi", symbol)
+                return
+            open_ms, close, rsi = result
+            cur, prev = rsi[-1], rsi[-2]
+            signal_ok, lowest = detect_signal(rsi, cfg.rsi_oversold, cfg.rsi_trigger)
+            close_ts = datetime.fromtimestamp(open_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            log.info("%s candle %s UTC close=%s RSI prev=%s cur=%s%s", symbol, close_ts, close,
+                     "n/a" if prev is None else f"{prev:.2f}", "n/a" if cur is None else f"{cur:.2f}",
+                     f" -> SINYAL (RSI min episode {lowest:.2f})" if signal_ok else "")
+
+            def mark() -> None:
+                self.state.last_candle[symbol] = open_ms
+                self.state.save()
+
+            if not signal_ok:
+                mark()
+                return
+
+            age_s = (now_ms - (open_ms + cfg.interval_ms)) / 1000
+            if age_s > cfg.signal_max_age:
+                log.warning("%s: sinyal sudah basi (%.0f dtk setelah close), dilewati", symbol, age_s)
+                mark()
+                return
+            if symbol in self.state.positions:
+                log.info("%s: sudah ada posisi, sinyal dilewati", symbol)
+                mark()
+                return
         if len(self.state.positions) >= cfg.max_open_positions:
             log.info("%s: batas MAX_OPEN_POSITIONS (%d) tercapai, sinyal dilewati", symbol, cfg.max_open_positions)
             mark()
